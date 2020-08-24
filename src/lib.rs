@@ -1,16 +1,21 @@
-use std::sync::Mutex;
 use std::ptr;
 use std::ptr::NonNull;
+use std::sync::Mutex;
 
 pub struct TsQueue<T> {
     head: Mutex<NonNull<Node<T>>>,
-    tail: Mutex<NonNull<Node<T>>>
+    tail: Mutex<NonNull<Node<T>>>,
 }
+
+// Drop is only needed for the Queue itself and not a single Node.
+// This implementation also avoids a stack overflow.
 impl<T> Drop for TsQueue<T> {
     fn drop(&mut self) {
-        let mut x = unsafe {Box::<Node<T>>::from_raw(self.head.get_mut().unwrap().as_ptr())};
-        while let Some(next) = x.next.take() {
-            x = unsafe {Box::from_raw(next.as_ptr())};
+        unsafe {
+            let mut x = Box::<Node<T>>::from_raw(self.head.get_mut().unwrap().as_ptr());
+            while let Some(next) = x.next.take() {
+                x = Box::from_raw(next.as_ptr());
+            }
         }
     }
 }
@@ -18,23 +23,18 @@ impl<T> Drop for TsQueue<T> {
 unsafe impl<T: Send> Send for TsQueue<T> {}
 unsafe impl<T: Send> Sync for TsQueue<T> {}
 
-
 struct Node<T> {
     data: Option<T>,
-    next: Option<NonNull<Node<T>>>
-}
-impl<T> Drop for Node<T> {
-    fn drop(&mut self) {
-        unsafe { self.next.map_or((),|n| {Box::from_raw(n.as_ptr());})}
-    }
+    next: Option<NonNull<Node<T>>>,
 }
 
 impl<T> Node<T> {
-    fn new() -> NonNull<Self<>> {
+    fn new() -> NonNull<Self> {
         Box::leak(Box::new(Self {
             data: None,
             next: None,
-        })).into()
+        }))
+        .into()
     }
 }
 
@@ -43,10 +43,7 @@ impl<T> TsQueue<T> {
         let dummy = Node::new();
         let tail = Mutex::new(dummy);
         let head = Mutex::new(dummy);
-        Self {
-            head,
-            tail
-        }
+        Self { head, tail }
     }
 
     pub fn enqueue(&self, data: T) {
@@ -65,18 +62,19 @@ impl<T> TsQueue<T> {
         if ptr::eq(head.as_ptr(), self.get_tail_ptr()) {
             return None;
         }
-        let mut head_box = unsafe{Box::<Node<T>>::from_raw(head.as_ptr())};
-        let data = head_box.data.take();
-        let new_head = head_box.next.take().expect("head != tail but head.next is empty");
+        let mut head_box = unsafe { Box::<Node<T>>::from_raw(head.as_ptr()) };
+        let new_head = head_box
+            .next
+            .take()
+            .expect("head != tail but head.next is empty");
         *head = new_head;
-        data
+        head_box.data.take()
     }
 
     fn get_tail_ptr(&self) -> *const Node<T> {
         self.tail.lock().expect("Unable to lock tail").as_ptr()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -85,10 +83,8 @@ mod tests {
     #[test]
     fn single_threaded() {
         let queue: TsQueue<i32> = TsQueue::new();
-        let data_expected: Vec<_> = (0..20).into_iter().collect();
+        let data_expected: Vec<_> = (0..5).into_iter().collect();
         let mut data = data_expected.clone();
-        queue.enqueue(1);
-        queue.dequeue();
         for i in data.drain(..) {
             queue.enqueue(i);
         }
@@ -104,23 +100,20 @@ mod tests {
         let data_expected: Vec<_> = (0..=9999).into_iter().collect();
         let mut data_recv = Vec::with_capacity(10000);
 
-
         rayon::join(
             || {
                 for i in &data_expected {
                     queue.enqueue(*i);
                 }
             },
-            || {
-                loop {
-                    if let Some(i) = queue.dequeue() {
-                        data_recv.push(i);
-                        if i == 9999 {
-                            break;
-                        }
+            || loop {
+                if let Some(i) = queue.dequeue() {
+                    data_recv.push(i);
+                    if i == 9999 {
+                        break;
                     }
                 }
-            }
+            },
         );
 
         assert_eq!(data_expected, data_recv);
